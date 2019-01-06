@@ -1,0 +1,285 @@
+using AzureStorageService.Model;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.WindowsAzure.Storage;
+using Microsoft.WindowsAzure.Storage.Blob;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+
+// For more information on enabling Web API for empty projects, visit http://go.microsoft.com/fwlink/?LinkID=397860
+
+namespace AzureStorageService.Controllers
+{
+    public class StorageController : Controller
+    {
+        /// <summary>
+        /// Function to check status of api.
+        /// </summary>
+        /// <returns></returns>
+        [HttpGet("storage/status")]
+        public IActionResult Get()
+        {
+            return Ok("Service running successfully!");
+        }
+
+        /// <summary>
+        /// Upload file to azure storage
+        /// </summary>
+        /// <param name="request">Azure request containg file bytes</param>
+        /// <returns></returns>
+        [HttpPost("storage/UploadFile")]
+        public async Task<AzureFileResponse> UploadFile([FromBody]AzureRequest request)
+        {
+            if (request == null)
+            {
+                return new AzureFileResponse { Status = "Failed" };
+            }
+            try
+            {
+                CloudBlobContainer container = GetContainerFromUri(request.ConnectionString, request.Container);
+                CloudBlockBlob blockBlob = container.GetBlockBlobReference(request.FilePath);
+
+                long fileByteLength = request.FileBytes.Length;
+                await blockBlob.UploadFromByteArrayAsync(request.FileBytes, 0, Convert.ToInt32(fileByteLength));
+                return new AzureFileResponse { Status = "Success" };
+            }
+            catch (Exception ex)
+            {
+                return new AzureFileResponse { Status = "Failed", Exception = ex.StackTrace };
+            }
+        }
+
+        /// <summary>
+        /// Get file from azure storage
+        /// </summary>
+        /// <param name="request">Azure request containing file details</param>
+        /// <returns></returns>
+        [HttpPost("storage/GetFile")]
+        public async Task<AzureFileResponse> GetFile([FromBody]AzureGetFileRequest request)
+        {
+            if (request == null)
+            {
+                return new AzureFileResponse { Status = "Failed" };
+            }
+            try
+            {
+                CloudBlobContainer container = GetContainerFromUri(request.ConnectionString, request.Container);
+
+                var resposne = GetFileAsBytes(request.FilePath, container);
+                return resposne.Result;
+            }
+            catch (Exception ex)
+            {
+                return new AzureFileResponse { Status = "Failed", Exception = ex.StackTrace };
+            }
+        }
+
+        /// <summary>
+        /// Downloads file from azure as bytes.
+        /// </summary>
+        /// <param name="path">File path</param>
+        /// <param name="container">Container details</param>
+        /// <returns></returns>
+        private async Task<AzureFileResponse> GetFileAsBytes(string path, CloudBlobContainer container)
+        {
+            CloudBlockBlob blockBlob = container.GetBlockBlobReference(path);
+            bool isExists = await blockBlob.ExistsAsync();
+            if (isExists)
+            {
+                await blockBlob.FetchAttributesAsync();
+                byte[] fileBytes = new byte[blockBlob.Properties.Length];
+                for (int i = 0; i < blockBlob.Properties.Length; i++)
+                {
+                    fileBytes[i] = 0x20;
+                }
+
+                await blockBlob.DownloadToByteArrayAsync(fileBytes, 0);
+                return new AzureFileResponse { Status = "Success", FileBytes = fileBytes, FileName = Path.GetFileName(blockBlob.Name) };
+            }
+            else
+            {
+                return new AzureFileResponse { Status = "Falied", Message = "File not exists!" };
+            }
+        }
+
+        /// <summary>
+        /// Get all files in a azure directory
+        /// </summary>
+        /// <param name="request">Request details</param>
+        /// <returns></returns>
+        [HttpPost("storage/GetAllFiles")]
+        public async Task<List<AzureFileResponse>> GetAllFiles([FromBody]AzureGetFileRequest request)
+        {
+            if (request == null)
+            {
+                return new List<AzureFileResponse> { new AzureFileResponse { Status = "Failed" } };
+            }
+            try
+            {
+                CloudBlobContainer container = GetContainerFromUri(request.ConnectionString, request.Container);
+
+                var blobDirectory = container.GetDirectoryReference(request.FilePath);
+
+                var list = new List<AzureFileResponse>();
+                var blobs = await blobDirectory.ListBlobsSegmentedAsync(null);
+                foreach (var blob in blobs.Results)
+                {
+                    /*Its a file not directory*/
+                    if (blob is CloudBlockBlob)
+                    {
+                        CloudBlockBlob b = (CloudBlockBlob)blob;
+                        var path = b.Name;
+                        list.Add(GetFileAsBytes(path, container).Result);
+                    }
+                }
+                return list;
+            }
+            catch (Exception ex)
+            {
+                return new List<AzureFileResponse> { new AzureFileResponse { Status = "Failed", Exception = ex.InnerException.ToString() } };
+            }
+        }
+
+        /// <summary>
+        /// Get container details from uri
+        /// </summary>
+        /// <param name="connectionString">Connection string</param>
+        /// <param name="container">continer details</param>
+        /// <returns></returns>
+        private static CloudBlobContainer GetContainerFromUri(string connectionString, string container)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(container)) ///Account level URL
+                {
+                    CloudStorageAccount storageAccount = CloudStorageAccount.Parse(connectionString);
+                    CloudBlobClient blobClient = storageAccount.CreateCloudBlobClient();
+                    return blobClient.GetContainerReference(container);
+                }
+                else///its a SAS URL
+                {
+                    return new CloudBlobContainer(new Uri(connectionString));
+                }
+            }
+            catch (Exception)
+            {
+                throw new ArgumentException("Invalid connection string");
+            }
+        }
+
+        /// <summary>
+        /// Archive folder
+        /// </summary>
+        /// <param name="request">Details containing files to be archived.</param>
+        /// <returns></returns>
+        [HttpPost("storage/ArchiveFolder")]
+        public async Task<AzureResponse> ArchiveFolder([FromBody]ArchiveRequest request)
+        {
+            if (request == null)
+            {
+                return new AzureResponse { Status = "Failed" };
+            }
+            try
+            {
+                CloudBlobContainer sourceContainer = GetContainerFromUri(request.ConnectionString, request.SourceContainer);
+                CloudBlobContainer destinationContainer = GetContainerFromUri(request.ConnectionString, request.DestinationContainer);
+
+                var blobDirectory = sourceContainer.GetDirectoryReference(request.SourceFolder);
+
+                var blobs = await blobDirectory.ListBlobsSegmentedAsync(null);
+                foreach (var blob in blobs.Results)
+                {
+                    /*Its a file not directory*/
+                    if (blob is CloudBlockBlob)
+                    {
+                        CloudBlockBlob b = (CloudBlockBlob)blob;
+
+                        var targetBlob = destinationContainer.GetBlockBlobReference(request.DestinationFolder + Path.GetFileName(b.Name));
+                        if (string.IsNullOrEmpty(request.SourceContainer))
+                        {
+                            await targetBlob.StartCopyAsync(b);
+                        }
+                        else
+                        {
+                            await targetBlob.StartCopyAsync(b.StorageUri.PrimaryUri);
+                        }
+                        await b.DeleteIfExistsAsync();
+                    }
+                }
+
+                return new AzureResponse { Status = "Success", Message = "Archival Completed" };
+            }
+            catch (Exception ex)
+            {
+                return new AzureResponse { Status = "Failed", Message = ex.InnerException.ToString() };
+            }
+        }
+
+        /// <summary>
+        /// Prepare the directory for Z tree load
+        /// </summary>
+        /// <param name="request">request details</param>
+        /// <returns></returns>
+        [HttpPost("storage/ListTree")]
+        public AzureFileTree ListTree([FromBody]AzureTreeRequest request)
+        {
+            if (request == null)
+            {
+                return new AzureFileTree { Status = "Failed", Message = "Request is empty." };
+            }
+            try
+            {
+                CloudBlobContainer sourceContainer = GetContainerFromUri(request.ConnectionString, request.Container);
+
+                sb = new List<Tree>();
+                if (string.IsNullOrEmpty(request.Folder))
+                {
+                    GetContainerDirectories(sourceContainer.ListBlobs());
+                }
+                else
+                {
+                    var sourceFolder = sourceContainer.GetDirectoryReference(request.Folder);
+                    GetContainerDirectories(sourceFolder.ListBlobs());
+                }
+
+                return new AzureFileTree { Status = "Success", FileTree = sb };
+            }
+            catch (Exception ex)
+            {
+                return new AzureFileTree { Status = "Failed", Message = ex.InnerException.ToString() };
+            }
+        }
+
+        private List<Tree> sb;
+
+        /// <summary>
+        /// Get directories in container.
+        /// </summary>
+        /// <param name="blobList">Blob list</param>
+        private void GetContainerDirectories(IEnumerable<IListBlobItem> blobList)
+        {
+            // First list all the actual FILES within
+            // the current blob list. No recursion needed:
+            foreach (var item in blobList.Where
+            ((blobItem, type) => blobItem is CloudBlockBlob))
+            {
+                var blobFile = item as CloudBlockBlob;
+                sb.Add(new Tree { Name = blobFile.Name, Id = blobFile.Name, ParentId = blobFile.Parent.Prefix, Title = Path.GetFileName(blobFile.Name), IsDirectory = false });
+            }
+
+            // List all additional subdirectories
+            // in the current directory, and call recursively:
+            foreach (var item in blobList.Where
+            ((blobItem, type) => blobItem is CloudBlobDirectory))
+            {
+                var directory = item as CloudBlobDirectory;
+                sb.Add(new Tree { Name = directory.Prefix, Id = directory.Prefix, ParentId = directory.Parent.Prefix, Title = new DirectoryInfo(directory.Prefix).Name, IsDirectory = true });
+
+                // Call this method recursively to retrieve subdirectories within the current:
+                GetContainerDirectories(directory.ListBlobs());
+            }
+        }
+    }
+}
